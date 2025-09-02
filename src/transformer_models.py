@@ -42,10 +42,63 @@ except ImportError as e:
     logger.warning(f"⚠️ Transformers library not available: {e}")
     logger.warning("Install with: pip install torch transformers accelerate")
 
-# Check for GPU availability
+# Check for device availability with CUDA priority for GPU environments
 if TRANSFORMERS_AVAILABLE:
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {DEVICE}")
+    if torch.cuda.is_available():
+        DEVICE = torch.device('cuda')
+        logger.info(f"Using device: {DEVICE} (CUDA GPU)")
+        # Set CUDA memory management
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        # Enable memory efficient attention if available
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            logger.info("✅ Flash attention enabled for CUDA")
+        except:
+            logger.info(
+                "Flash attention not available, using standard attention")
+    elif torch.backends.mps.is_available():
+        DEVICE = torch.device('mps')
+        logger.info(f"Using device: {DEVICE} (Metal Performance Shaders)")
+    else:
+        DEVICE = torch.device('cpu')
+        logger.info(f"Using device: {DEVICE}")
+
+    # Memory management utilities
+    def cleanup_memory():
+        """Clean up GPU memory."""
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                logger.debug("CUDA memory cleaned and synchronized")
+            elif torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+                logger.debug("MPS memory cleaned")
+        except Exception as e:
+            logger.warning(f"Memory cleanup warning: {e}")
+        import gc
+        gc.collect()
+
+    def get_gpu_info():
+        """Get detailed GPU information for optimization."""
+        if not torch.cuda.is_available():
+            return None
+
+        try:
+            gpu_props = torch.cuda.get_device_properties(0)
+            return {
+                'name': gpu_props.name,
+                'memory_total': gpu_props.total_memory / (1024**3),  # GB
+                'memory_free': torch.cuda.memory_reserved(0) / (1024**3),  # GB
+                'compute_capability': f"{gpu_props.major}.{gpu_props.minor}",
+                'multi_processor_count': gpu_props.multi_processor_count,
+                'supports_bf16': torch.cuda.is_bf16_supported(),
+                'supports_fp16': True,  # All CUDA GPUs support fp16
+            }
+        except Exception as e:
+            logger.warning(f"Failed to get GPU info: {e}")
+            return None
 
 
 class ContractDataset(Dataset):
@@ -124,6 +177,16 @@ class TransformerClassifier:
         self.is_trained = False
         self.class_names = None
 
+        # Get GPU info for optimization
+        self.gpu_info = get_gpu_info()
+        if self.gpu_info:
+            logger.info(
+                f"GPU detected: {self.gpu_info['name']} ({self.gpu_info['memory_total']:.1f}GB)")
+            logger.info(
+                f"Compute capability: {self.gpu_info['compute_capability']}")
+            logger.info(
+                f"bfloat16 support: {'✅' if self.gpu_info['supports_bf16'] else '❌'}")
+
         logger.info(
             f"Initialized {self.__class__.__name__} with model: {model_name}")
 
@@ -132,24 +195,70 @@ class TransformerClassifier:
         try:
             logger.info(f"Loading tokenizer and model: {self.model_name}")
 
-            # Load tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            # Load tokenizer with error handling
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_name,
+                    use_fast=True,
+                    trust_remote_code=False
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load fast tokenizer, falling back to slow: {e}")
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_name,
+                    use_fast=False,
+                    trust_remote_code=False
+                )
 
             # Add padding token if not present
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
-            # Load model
-            self.model = AutoModelForSequenceClassification.from_pretrained(
-                self.model_name,
-                num_labels=self.num_labels,
-                problem_type="single_label_classification"
-            )
+            # Load model with error handling
+            try:
+                # Use mixed precision for CUDA if available
+                if torch.cuda.is_available():
+                    # Check if bf16 is available (better than fp16 for training)
+                    if torch.cuda.is_bf16_supported():
+                        torch_dtype = torch.bfloat16
+                        logger.info(
+                            "Using bfloat16 precision for CUDA training")
+                    else:
+                        torch_dtype = torch.float16
+                        logger.info(
+                            "Using float16 precision for CUDA training")
+                else:
+                    torch_dtype = torch.float32
+                    logger.info("Using float32 precision for CPU/MPS training")
 
-            # Move to device
-            self.model.to(DEVICE)
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    self.model_name,
+                    num_labels=self.num_labels,
+                    problem_type="single_label_classification",
+                    torch_dtype=torch_dtype,
+                    low_cpu_mem_usage=True,
+                    device_map="auto" if torch.cuda.is_available() else None
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load with optimizations, falling back: {e}")
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    self.model_name,
+                    num_labels=self.num_labels,
+                    problem_type="single_label_classification"
+                )
 
-            logger.info(f"✅ Model loaded successfully on {DEVICE}")
+            # Move to device with error handling
+            try:
+                self.model.to(DEVICE)
+                logger.info(f"✅ Model loaded successfully on {DEVICE}")
+            except Exception as e:
+                logger.error(f"Failed to move model to {DEVICE}: {e}")
+                # Fallback to CPU
+                fallback_device = torch.device('cpu')
+                self.model.to(fallback_device)
+                logger.warning(f"Fallback: Model loaded on {fallback_device}")
 
         except Exception as e:
             logger.error(f"❌ Failed to load model {self.model_name}: {e}")
@@ -226,6 +335,43 @@ class TransformerClassifier:
         # Set up training arguments
         output_dir = training_args.get('output_dir', './transformer_results')
 
+        # Enable mixed precision based on device
+        if torch.cuda.is_available():
+            if torch.cuda.is_bf16_supported():
+                fp16 = False
+                bf16 = True
+                logger.info("Using bfloat16 mixed precision for CUDA training")
+            else:
+                fp16 = True
+                bf16 = False
+                logger.info("Using float16 mixed precision for CUDA training")
+        else:
+            fp16 = False
+            bf16 = False
+            logger.info("Mixed precision disabled for CPU/MPS training")
+
+        # Dynamically adjust batch size based on GPU memory if available
+        if self.gpu_info and torch.cuda.is_available():
+            gpu_memory = self.gpu_info['memory_total']
+            requested_batch_size = training_args.get('batch_size', 16)
+
+            # Adjust batch size based on GPU memory
+            if gpu_memory >= 24:  # High-end GPU
+                max_batch_size = 32
+            elif gpu_memory >= 16:  # Mid-range GPU
+                max_batch_size = 24
+            elif gpu_memory >= 8:  # Entry-level GPU
+                max_batch_size = 16
+            else:  # Low VRAM GPU
+                max_batch_size = 8
+
+            # Use the smaller of requested or max supported
+            adjusted_batch_size = min(requested_batch_size, max_batch_size)
+            if adjusted_batch_size != requested_batch_size:
+                logger.info(
+                    f"Adjusted batch size from {requested_batch_size} to {adjusted_batch_size} based on GPU memory ({gpu_memory:.1f}GB)")
+                training_args['batch_size'] = adjusted_batch_size
+
         args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=training_args.get('num_epochs', 3),
@@ -235,18 +381,44 @@ class TransformerClassifier:
             warmup_steps=training_args.get('warmup_steps', 500),
             weight_decay=training_args.get('weight_decay', 0.01),
             learning_rate=training_args.get('learning_rate', 2e-5),
+            gradient_accumulation_steps=training_args.get(
+                'gradient_accumulation_steps', 1),
+            max_grad_norm=training_args.get('max_grad_norm', 1.0),
+
+            # Logging and evaluation
             logging_dir=f'{output_dir}/logs',
-            logging_steps=training_args.get('logging_steps', 10),
+            logging_steps=training_args.get('logging_steps', 50),
             eval_steps=training_args.get('eval_steps', 100),
             save_steps=training_args.get('save_steps', 500),
-            eval_strategy="steps",  # Changed from evaluation_strategy
+            eval_strategy="steps",
             save_strategy="steps",
+
+            # Model selection
             load_best_model_at_end=True,
-            metric_for_best_model="eval_accuracy",
+            metric_for_best_model="eval_f1",  # Use F1 instead of accuracy
             greater_is_better=True,
+
+            # Memory and performance optimizations
+            dataloader_num_workers=training_args.get(
+                'dataloader_num_workers', 2 if torch.cuda.is_available() else 0),
+            dataloader_pin_memory=training_args.get(
+                'dataloader_pin_memory', True if torch.cuda.is_available() else False),
             remove_unused_columns=False,
+            fp16=fp16,
+            bf16=bf16,
+
+            # GPU-specific optimizations
+            gradient_checkpointing=training_args.get(
+                'gradient_checkpointing', True if torch.cuda.is_available() else False),
+            optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
+
+            # Disable external logging
             push_to_hub=False,
-            report_to=None  # Disable wandb/tensorboard logging
+            report_to=None,
+
+            # Save disk space
+            save_total_limit=2,  # Only keep 2 checkpoints
+            resume_from_checkpoint=None,  # Don't auto-resume for cleaner runs
         )
 
         # Define compute metrics function
@@ -278,11 +450,22 @@ class TransformerClassifier:
 
         # Start training
         logger.info("Starting training...")
+
+        # Monitor GPU memory if available
+        if torch.cuda.is_available():
+            logger.info(
+                f"GPU memory before training: {torch.cuda.memory_allocated(0) / (1024**3):.2f}GB")
+
         train_result = self.trainer.train()
 
         # Evaluate
         logger.info("Evaluating model...")
         eval_result = self.trainer.evaluate()
+
+        # Log final GPU memory usage
+        if torch.cuda.is_available():
+            logger.info(
+                f"GPU memory after training: {torch.cuda.memory_allocated(0) / (1024**3):.2f}GB")
 
         self.is_trained = True
 
@@ -493,9 +676,33 @@ class LegalBERTClassifier(TransformerClassifier):
 
     def __init__(self, num_labels: int, max_length: int = 512, random_state: int = 42):
         """Initialize LegalBERT classifier."""
-        # Use the most popular LegalBERT model from HuggingFace
+        # Try multiple LegalBERT models in order of preference
+        legal_bert_models = [
+            'nlpaueb/legal-bert-small-uncased',  # Smaller, more stable
+            'nlpaueb/legal-bert-base-uncased',   # Original choice
+            'bert-base-uncased'  # Fallback to regular BERT
+        ]
+
+        model_name = None
+        for candidate in legal_bert_models:
+            try:
+                # Test if model is accessible
+                from transformers import AutoTokenizer
+                AutoTokenizer.from_pretrained(candidate, use_fast=False)
+                model_name = candidate
+                logger.info(f"Using LegalBERT model: {model_name}")
+                break
+            except Exception as e:
+                logger.warning(f"Failed to access {candidate}: {e}")
+                continue
+
+        if model_name is None:
+            model_name = 'bert-base-uncased'
+            logger.warning(
+                "Falling back to BERT-base-uncased for legal classification")
+
         super().__init__(
-            model_name='nlpaueb/legal-bert-base-uncased',
+            model_name=model_name,
             num_labels=num_labels,
             max_length=max_length,
             random_state=random_state
