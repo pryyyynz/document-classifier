@@ -1,0 +1,15 @@
+__pycache__
+*.py[cod]
+*.pyc
+.venv
+.git
+.gitignore
+.DS_Store
+pytest.ini
+.pytest_cache
+tests
+transformer_models_output
+explanation_reports
+models_output
+*.ipynb
+Dockerfile
