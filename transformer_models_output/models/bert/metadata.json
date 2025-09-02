@@ -1,0 +1,13 @@
+{
+  "model_name": "bert-base-uncased",
+  "num_labels": 5,
+  "max_length": 512,
+  "class_names": [
+    "employment_contract",
+    "nda",
+    "partnership",
+    "service",
+    "vendor"
+  ],
+  "random_state": 42
+}
