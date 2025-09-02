@@ -24,8 +24,17 @@ accelerate>=0.20.0
 # Machine Learning
 scikit-learn>=1.5.2
 
+# Explainability
+lime>=0.2.0.1
+
 # HTTP requests (for data loading)
 requests>=2.31.0
+
+# API Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+python-docx>=0.8.11
 
 # Development and testing
 pytest>=7.0.0
